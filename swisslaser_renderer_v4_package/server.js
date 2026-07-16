@@ -6,7 +6,19 @@ const sharp = require('sharp');
 const app = express();
 const PORT = Number(process.env.PORT || 8787);
 
-app.use(express.json({ limit: '40mb' }));
+app.use(express.json({ limit: '50mb' }));
+
+const LOCKED = {
+  width: 1080,
+  height: 1350,
+  footerHeight: 154,
+  fonts: {
+    heading: 'Poppins',
+    body: 'Poppins',
+    meta: 'Poppins',
+    quotes: 'DejaVu Serif',
+  },
+};
 
 function clean(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -42,7 +54,7 @@ function wrapText(text, maxCharsPerLine) {
   for (const word of words) {
     const candidate = current ? `${current} ${word}` : word;
 
-    if (candidate.length <= maxCharsPerLine || !current) {
+    if (!current || candidate.length <= maxCharsPerLine) {
       current = candidate;
       continue;
     }
@@ -51,36 +63,47 @@ function wrapText(text, maxCharsPerLine) {
     current = word;
   }
 
-  if (current) lines.push(current);
+  if (current) {
+    lines.push(current);
+  }
+
   return lines;
 }
 
-function reviewLayout(review) {
+function getReviewLayout(review, variant) {
   const length = clean(review).length;
+  const isDark = variant === 'dark';
 
-  let fontSize = 39;
-  let lineHeight = 63;
-  let maxChars = 29;
+  let fontSize = isDark ? 38 : 37;
+  let lineHeight = isDark ? 81 : 69;
+  let maxChars = isDark ? 34 : 29;
+  const maxLines = isDark ? 5 : 6;
 
   if (length > 130) {
-    fontSize = 35;
-    lineHeight = 56;
-    maxChars = 33;
+    fontSize -= 3;
+    lineHeight -= isDark ? 8 : 7;
+    maxChars += 3;
   }
 
   if (length > 175) {
-    fontSize = 31;
-    lineHeight = 49;
-    maxChars = 38;
+    fontSize -= 3;
+    lineHeight -= isDark ? 7 : 6;
+    maxChars += 4;
   }
 
   let lines = wrapText(review, maxChars);
 
-  while (lines.length > 7 && fontSize > 27) {
-    fontSize -= 2;
-    lineHeight -= 3;
-    maxChars += 3;
+  while (lines.length > maxLines && fontSize > 27) {
+    fontSize -= 1;
+    lineHeight -= 2;
+    maxChars += 2;
     lines = wrapText(review, maxChars);
+  }
+
+  if (lines.length > 7) {
+    throw new Error(
+      'review_quote cannot fit the locked testimonial layout.'
+    );
   }
 
   return {
@@ -92,128 +115,138 @@ function reviewLayout(review) {
 
 async function fetchBuffer(url) {
   const value = clean(url);
-  if (!value) return null;
+
+  if (!value) {
+    throw new Error('template_url is required.');
+  }
 
   const response = await fetch(value, {
     headers: {
-      'User-Agent': 'SwissLaserRenderer/4.0',
+      'User-Agent': 'SwissLaserRenderer/5.0',
       Accept: 'image/*',
     },
   });
 
   if (!response.ok) {
-    throw new Error(`Template download failed with HTTP ${response.status}.`);
+    throw new Error(
+      `Template download failed with HTTP ${response.status}.`
+    );
   }
 
   return Buffer.from(await response.arrayBuffer());
 }
 
-async function detectAndExtractFooter(templateBuffer, canvasWidth, footerHeight) {
-  const resized = sharp(templateBuffer).rotate().resize({ width: canvasWidth });
-  const { data, info } = await resized
-    .removeAlpha()
+async function assertUsefulTransparency(buffer) {
+  const image = sharp(buffer)
+    .rotate()
+    .ensureAlpha();
+
+  const { data, info } = await image
     .raw()
     .toBuffer({ resolveWithObject: true });
 
-  const channels = info.channels;
-  const sampleStep = 18;
-  let footerStart = info.height - 1;
-  let foundDarkRun = false;
+  const alphaIndex = info.channels - 1;
 
-  for (let y = info.height - 1; y >= 0; y -= 1) {
-    let total = 0;
-    let samples = 0;
+  let transparentSamples = 0;
+  let totalSamples = 0;
 
-    for (let x = 0; x < info.width; x += sampleStep) {
-      const offset = (y * info.width + x) * channels;
-      const r = data[offset] || 0;
-      const g = data[offset + 1] || 0;
-      const b = data[offset + 2] || 0;
-      total += (r + g + b) / 3;
-      samples += 1;
+  const step = Math.max(
+    1,
+    Math.floor(
+      Math.min(info.width, info.height) / 220
+    )
+  );
+
+  for (let y = 0; y < info.height; y += step) {
+    for (let x = 0; x < info.width; x += step) {
+      const offset =
+        (y * info.width + x) * info.channels;
+
+      const alpha = data[offset + alphaIndex];
+
+      if (alpha < 245) {
+        transparentSamples += 1;
+      }
+
+      totalSamples += 1;
     }
-
-    const average = samples ? total / samples : 255;
-    const isDark = average < 42;
-
-    if (isDark) {
-      footerStart = y;
-      foundDarkRun = true;
-      continue;
-    }
-
-    if (foundDarkRun) break;
   }
 
-  let sourceFooterHeight = info.height - footerStart;
+  const transparentRatio = totalSamples
+    ? transparentSamples / totalSamples
+    : 0;
 
-  if (!foundDarkRun || sourceFooterHeight < 70 || sourceFooterHeight > info.height * 0.25) {
-    sourceFooterHeight = Math.round(info.height * 0.105);
-    footerStart = info.height - sourceFooterHeight;
+  if (transparentRatio < 0.05) {
+    throw new Error(
+      'The generated hero image is not genuinely transparent. ' +
+      'Set the OpenAI image node to Background: Transparent ' +
+      'and Output Format: PNG.'
+    );
   }
+}
 
-  return sharp(templateBuffer)
+async function prepareSubject(
+  heroBuffer,
+  width,
+  heroHeight,
+  variant
+) {
+  await assertUsefulTransparency(heroBuffer);
+
+  const isDark = variant === 'dark';
+
+  /*
+   * Dark designs allow the model to extend further
+   * toward the centre, matching the dark reference.
+   */
+  const subjectBoxWidth = isDark
+    ? 735
+    : 655;
+
+  const subjectLeft =
+    width - subjectBoxWidth;
+
+  const verticalOffset = isDark
+    ? 0
+    : 6;
+
+  const trimmed = await sharp(heroBuffer)
     .rotate()
-    .resize({ width: canvasWidth })
-    .extract({
-      left: 0,
-      top: footerStart,
-      width: canvasWidth,
-      height: sourceFooterHeight,
-    })
-    .resize({
-      width: canvasWidth,
-      height: footerHeight,
-      fit: 'fill',
+    .ensureAlpha()
+    .trim({
+      background: {
+        r: 0,
+        g: 0,
+        b: 0,
+        alpha: 0,
+      },
+      threshold: 8,
     })
     .png()
     .toBuffer();
-}
 
-function fallbackFooterSvg(width, height) {
-  const scale = width / 1080;
-  const y = Math.round(height * 0.60);
+  const subjectLayer = await sharp(trimmed)
+    .resize({
+      width: subjectBoxWidth,
+      height: heroHeight - verticalOffset,
+      fit: 'contain',
+      position: 'right bottom',
+      background: {
+        r: 0,
+        g: 0,
+        b: 0,
+        alpha: 0,
+      },
+      withoutEnlargement: false,
+    })
+    .png()
+    .toBuffer();
 
-  return Buffer.from(`
-    <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
-      <rect width="${width}" height="${height}" fill="#000000"/>
-
-      <text x="${Math.round(48 * scale)}" y="${y}"
-        font-family="DejaVu Sans, Arial, sans-serif"
-        font-size="${Math.round(45 * scale)}"
-        fill="#ffffff">
-        <tspan font-weight="300">SWISS</tspan><tspan font-weight="700">LASER</tspan>
-      </text>
-      <line x1="${Math.round(49 * scale)}" y1="${Math.round(y + 8 * scale)}"
-        x2="${Math.round(368 * scale)}" y2="${Math.round(y + 8 * scale)}"
-        stroke="#ffffff" stroke-width="1"/>
-      <text x="${Math.round(207 * scale)}" y="${Math.round(y + 29 * scale)}"
-        font-family="DejaVu Sans, Arial, sans-serif"
-        font-size="${Math.round(16 * scale)}" fill="#ffffff">UNITED KINGDOM</text>
-
-      <line x1="${Math.round(402 * scale)}" y1="${Math.round(35 * scale)}"
-        x2="${Math.round(402 * scale)}" y2="${Math.round(height - 31 * scale)}"
-        stroke="#ffffff" stroke-width="1"/>
-
-      <text x="${Math.round(442 * scale)}" y="${Math.round(y + 1 * scale)}"
-        font-family="DejaVu Sans, Arial, sans-serif"
-        font-size="${Math.round(35 * scale)}" font-weight="300" fill="#ffffff">0333 038 6624</text>
-
-      <line x1="${Math.round(720 * scale)}" y1="${Math.round(35 * scale)}"
-        x2="${Math.round(720 * scale)}" y2="${Math.round(height - 31 * scale)}"
-        stroke="#ffffff" stroke-width="1"/>
-
-      <circle cx="${Math.round(769 * scale)}" cy="${Math.round(y - 10 * scale)}"
-        r="${Math.round(18 * scale)}" fill="none" stroke="#ffffff" stroke-width="3"/>
-      <path d="M ${Math.round(758 * scale)} ${Math.round(y + 7 * scale)}
-        L ${Math.round(761 * scale)} ${Math.round(y - 1 * scale)}"
-        stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
-
-      <text x="${Math.round(802 * scale)}" y="${Math.round(y + 1 * scale)}"
-        font-family="DejaVu Sans, Arial, sans-serif"
-        font-size="${Math.round(33 * scale)}" font-weight="300" fill="#ffffff">07354 708 976</text>
-    </svg>
-  `);
+  return {
+    buffer: subjectLayer,
+    left: subjectLeft,
+    top: verticalOffset,
+  };
 }
 
 function buildTextSvg({
@@ -224,83 +257,248 @@ function buildTextSvg({
   serviceName,
   reviewQuote,
   reviewerName,
-  leftPanelWidth,
-  typography = {},
-  quoteStyle = {},
-  requestedLayout = {},
-  panelColour,
 }) {
   const isDark = variant === 'dark';
-  const textColour = isDark ? '#FFFFFF' : '#111111';
-  const secondaryColour = isDark ? '#F1F1F1' : '#111111';
-  const quoteColour = clean(quoteStyle.quote_colour) || (isDark ? '#7A7A7A' : '#CFCFCF');
-  const fillColour = clean(panelColour) || (isDark ? '#3E3E3E' : '#F8F7F5');
 
-  const headingFamily = clean(typography.family_heading) || 'Liberation Sans, DejaVu Sans, Arial, sans-serif';
-  const bodyFamily = clean(typography.family_body) || 'Liberation Sans, DejaVu Sans, Arial, sans-serif';
-  const metaFamily = clean(typography.family_meta) || 'Liberation Sans, DejaVu Sans, Arial, sans-serif';
+  const textColour = isDark
+    ? '#F7F7F5'
+    : '#0D0D0D';
 
-  const headingX = numberValue(requestedLayout.heading_x, 60);
-  const headingY = numberValue(requestedLayout.heading_y, 222);
-  const serviceX = numberValue(requestedLayout.service_x, 60);
-  const serviceY = numberValue(requestedLayout.service_y, 290);
-  const openingQuoteX = numberValue(requestedLayout.opening_quote_x, 34);
-  const openingQuoteY = numberValue(requestedLayout.opening_quote_y, 470);
-  const bodyX = numberValue(requestedLayout.body_x, 62);
-  const bodyStartY = numberValue(requestedLayout.body_start_y, 585);
-  const reviewerX = numberValue(requestedLayout.reviewer_x, 62);
+  const secondaryColour = isDark
+    ? '#F4F4F2'
+    : '#171717';
 
-  const layout = reviewLayout(reviewQuote);
-  const lineMarkup = layout.lines.map((line, index) => {
-    const y = bodyStartY + index * layout.lineHeight;
-    return `<text x="${bodyX}" y="${y}"
-      font-family="${escapeXml(bodyFamily)}"
-      font-size="${layout.fontSize}"
-      font-style="italic"
-      font-weight="400"
-      fill="${textColour}">${escapeXml(line)}</text>`;
-  }).join('');
+  const quoteColour = isDark
+    ? '#BDBDBD'
+    : '#C7C7C7';
 
-  const lastLineY = bodyStartY + Math.max(0, layout.lines.length - 1) * layout.lineHeight;
-  const closingQuoteY = Math.min(lastLineY + 90, heroHeight - 170);
-  const closingQuoteX = Math.min(leftPanelWidth - 80, 405);
-  const dividerY = Math.min(lastLineY + 122, heroHeight - 120);
-  const reviewerY = Math.min(lastLineY + 171, heroHeight - 68);
+  const layout = getReviewLayout(
+    reviewQuote,
+    variant
+  );
 
+  /*
+   * The light and dark references have intentionally
+   * different vertical compositions.
+   */
+  const settings = isDark
+    ? {
+        headingX: 58,
+        headingY: 185,
+        headingSize: 60,
+
+        serviceX: 66,
+        serviceY: 258,
+        serviceSize: 39,
+
+        topRuleX1: 282,
+        topRuleX2: 420,
+        topRuleY: 428,
+
+        openingQuoteX: 28,
+        openingQuoteY: 650,
+        openingQuoteSize: 126,
+
+        bodyX: 82,
+        bodyStartY: 735,
+
+        closingQuoteX: 585,
+
+        reviewerInline: true,
+      }
+    : {
+        headingX: 58,
+        headingY: 345,
+        headingSize: 59,
+
+        serviceX: 62,
+        serviceY: 410,
+        serviceSize: 39,
+
+        openingQuoteX: 46,
+        openingQuoteY: 530,
+        openingQuoteSize: 124,
+
+        bodyX: 64,
+        bodyStartY: 610,
+
+        closingQuoteX: 405,
+
+        reviewerInline: false,
+      };
+
+  const lineMarkup = layout.lines
+    .map((line, index) => {
+      const y =
+        settings.bodyStartY +
+        index * layout.lineHeight;
+
+      return `
+        <text
+          x="${settings.bodyX}"
+          y="${y}"
+          font-family="${LOCKED.fonts.body}"
+          font-size="${layout.fontSize}"
+          font-style="italic"
+          font-weight="300"
+          letter-spacing="-0.25"
+          fill="${textColour}"
+        >${escapeXml(line)}</text>
+      `;
+    })
+    .join('');
+
+  const lastLineY =
+    settings.bodyStartY +
+    Math.max(0, layout.lines.length - 1) *
+      layout.lineHeight;
+
+  const closingQuoteY = isDark
+    ? Math.min(
+        lastLineY + 92,
+        heroHeight - 120
+      )
+    : Math.min(
+        lastLineY + 94,
+        heroHeight - 165
+      );
+
+  const lightDividerY = Math.min(
+    lastLineY + 132,
+    heroHeight - 116
+  );
+
+  const lightReviewerY = Math.min(
+    lastLineY + 195,
+    heroHeight - 64
+  );
+
+  const darkReviewerY = Math.min(
+    lastLineY + 104,
+    heroHeight - 72
+  );
+
+  const darkTopRule = isDark
+    ? `
+      <line
+        x1="${settings.topRuleX1}"
+        y1="${settings.topRuleY}"
+        x2="${settings.topRuleX2}"
+        y2="${settings.topRuleY}"
+        stroke="#E1E1E1"
+        stroke-width="1.5"
+      />
+    `
+    : '';
+
+  const reviewerMarkup =
+    settings.reviewerInline
+      ? `
+        <line
+          x1="347"
+          y1="${darkReviewerY - 7}"
+          x2="378"
+          y2="${darkReviewerY - 7}"
+          stroke="${textColour}"
+          stroke-width="1.5"
+        />
+
+        <text
+          x="390"
+          y="${darkReviewerY}"
+          font-family="${LOCKED.fonts.meta}"
+          font-size="26"
+          font-style="italic"
+          font-weight="300"
+          fill="${textColour}"
+        >${escapeXml(reviewerName)}</text>
+      `
+      : `
+        <line
+          x1="61"
+          y1="${lightDividerY}"
+          x2="114"
+          y2="${lightDividerY}"
+          stroke="${textColour}"
+          stroke-width="1.6"
+        />
+
+        <text
+          x="61"
+          y="${lightReviewerY}"
+          font-family="${LOCKED.fonts.meta}"
+          font-size="27"
+          font-weight="300"
+          fill="${textColour}"
+        >${escapeXml(reviewerName)}</text>
+      `;
+
+  /*
+   * There is intentionally no background rectangle.
+   * The template and treatment subject remain visible.
+   */
   return Buffer.from(`
-    <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${heroHeight}" viewBox="0 0 ${width} ${heroHeight}">
-      <rect x="0" y="0" width="${leftPanelWidth}" height="${heroHeight}" fill="${fillColour}"/>
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="${width}"
+      height="${heroHeight}"
+      viewBox="0 0 ${width} ${heroHeight}"
+    >
+      <text
+        x="${settings.headingX}"
+        y="${settings.headingY}"
+        font-family="${LOCKED.fonts.heading}"
+        font-size="${settings.headingSize}"
+        font-weight="600"
+        letter-spacing="-1.1"
+        fill="${textColour}"
+      >${escapeXml(heading)}</text>
 
-      <text x="${headingX}" y="${headingY}"
-        font-family="${escapeXml(headingFamily)}"
-        font-size="62" font-weight="700" fill="${textColour}">${escapeXml(heading)}</text>
+      <text
+        x="${settings.serviceX}"
+        y="${settings.serviceY}"
+        font-family="${LOCKED.fonts.meta}"
+        font-size="${settings.serviceSize}"
+        font-weight="300"
+        letter-spacing="-0.35"
+        fill="${secondaryColour}"
+      >${escapeXml(serviceName)}</text>
 
-      <text x="${serviceX}" y="${serviceY}"
-        font-family="${escapeXml(metaFamily)}"
-        font-size="38" font-weight="300" letter-spacing="0.4" fill="${secondaryColour}">${escapeXml(serviceName)}</text>
+      ${darkTopRule}
 
-      <text x="${openingQuoteX}" y="${openingQuoteY}"
-        font-family="DejaVu Serif, Georgia, serif"
-        font-size="132" font-weight="700" fill="${quoteColour}">“</text>
+      <text
+        x="${settings.openingQuoteX}"
+        y="${settings.openingQuoteY}"
+        font-family="${LOCKED.fonts.quotes}, Georgia, serif"
+        font-size="${settings.openingQuoteSize}"
+        font-weight="700"
+        fill="${quoteColour}"
+      >“</text>
 
       ${lineMarkup}
 
-      <text x="${closingQuoteX}" y="${closingQuoteY}"
-        font-family="DejaVu Serif, Georgia, serif"
-        font-size="108" font-weight="700" fill="${quoteColour}">”</text>
+      <text
+        x="${settings.closingQuoteX}"
+        y="${closingQuoteY}"
+        font-family="${LOCKED.fonts.quotes}, Georgia, serif"
+        font-size="106"
+        font-weight="700"
+        fill="${quoteColour}"
+      >”</text>
 
-      <line x1="${reviewerX}" y1="${dividerY}" x2="${reviewerX + 54}" y2="${dividerY}"
-        stroke="${textColour}" stroke-width="2"/>
-
-      <text x="${reviewerX}" y="${reviewerY}"
-        font-family="${escapeXml(metaFamily)}"
-        font-size="28" font-weight="300" fill="${textColour}">${escapeXml(reviewerName)}</text>
+      ${reviewerMarkup}
     </svg>
   `);
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'swisslaser-renderer', version: '4.0.0' });
+  res.json({
+    ok: true,
+    service: 'swisslaser-renderer',
+    version: '5.0.0',
+    typography: 'Poppins locked',
+    templates: 'full-image locked',
+  });
 });
 
 app.post('/render-review', async (req, res) => {
@@ -308,108 +506,204 @@ app.post('/render-review', async (req, res) => {
     const payload = req.body || {};
     const canvas = payload.canvas || {};
 
-    const width = clamp(Math.round(numberValue(canvas.width, 1080)), 600, 2160);
-    const height = clamp(Math.round(numberValue(canvas.height, 1350)), 750, 2700);
-    const footerHeight = clamp(
-      Math.round(numberValue(payload.footer_height, height * 0.114)),
-      100,
-      Math.round(height * 0.18),
+    const width = clamp(
+      Math.round(
+        numberValue(
+          canvas.width,
+          LOCKED.width
+        )
+      ),
+      600,
+      2160
     );
-    const heroHeight = height - footerHeight;
-    const variant = clean(payload.template_variant).toLowerCase() === 'dark' ? 'dark' : 'light';
-    const background = clean(payload.background_fill) || (variant === 'dark' ? '#3E3E3E' : '#F8F7F5');
-    const leftPanelColour = clean(payload.left_panel_fill) || background;
-    const leftPanelPercent = clamp(numberValue(payload.hero?.text_zone_percent, 46), 40, 54);
-    const leftPanelWidth = Math.round(width * leftPanelPercent / 100);
 
-    const heroBase64 = stripDataUri(payload.hero_image_base64);
-    if (!heroBase64) {
-      throw new Error('hero_image_base64 is required.');
-    }
+    const height = clamp(
+      Math.round(
+        numberValue(
+          canvas.height,
+          LOCKED.height
+        )
+      ),
+      750,
+      2700
+    );
 
-    const reviewQuote = clean(payload.review_quote);
+    const footerHeight = clamp(
+      Math.round(
+        numberValue(
+          payload.footer_height,
+          LOCKED.footerHeight
+        )
+      ),
+      100,
+      Math.round(height * 0.18)
+    );
+
+    const heroHeight =
+      height - footerHeight;
+
+    const variant =
+      clean(payload.template_variant)
+        .toLowerCase() === 'dark'
+        ? 'dark'
+        : 'light';
+
+    const reviewQuote = clean(
+      payload.review_quote
+    );
+
     if (!reviewQuote) {
-      throw new Error('review_quote is required.');
+      throw new Error(
+        'review_quote is required.'
+      );
     }
 
     if (reviewQuote.length > 220) {
-      throw new Error('review_quote exceeds the locked 220 character layout limit.');
+      throw new Error(
+        'review_quote exceeds the locked ' +
+        '220 character layout limit.'
+      );
     }
 
-    const heroBuffer = Buffer.from(heroBase64, 'base64');
+    const heroBase64 = stripDataUri(
+      payload.hero_image_base64
+    );
+
+    if (!heroBase64) {
+      throw new Error(
+        'hero_image_base64 is required.'
+      );
+    }
+
+    const heroBuffer = Buffer.from(
+      heroBase64,
+      'base64'
+    );
+
     if (!heroBuffer.length) {
-      throw new Error('Decoded hero image was empty.');
+      throw new Error(
+        'Decoded hero image was empty.'
+      );
     }
 
-    const preparedHero = await sharp(heroBuffer)
+    /*
+     * Use the complete uploaded template:
+     * background, footer, official logo and numbers.
+     */
+    const templateBuffer = await fetchBuffer(
+      payload.template_url
+    );
+
+    const baseTemplate = await sharp(
+      templateBuffer
+    )
       .rotate()
       .resize({
         width,
-        height: heroHeight,
-        fit: clean(payload.hero?.fit) || 'cover',
-        position: clean(payload.hero?.position) || 'right center',
-        background,
+        height,
+        fit: 'fill',
       })
-      .flatten({ background })
       .png()
       .toBuffer();
 
-    let footerBuffer;
-    try {
-      const templateBuffer = await fetchBuffer(payload.template_url);
-      footerBuffer = templateBuffer
-        ? await detectAndExtractFooter(templateBuffer, width, footerHeight)
-        : fallbackFooterSvg(width, footerHeight);
-    } catch (error) {
-      console.warn('Template footer fallback:', error.message);
-      footerBuffer = fallbackFooterSvg(width, footerHeight);
-    }
+    const subject = await prepareSubject(
+      heroBuffer,
+      width,
+      heroHeight,
+      variant
+    );
 
     const textOverlay = buildTextSvg({
       width,
       heroHeight,
       variant,
-      heading: clean(payload.heading) || 'TESTIMONIALS',
-      serviceName: clean(payload.service_name) || 'LASER HAIR REMOVAL',
+
+      heading:
+        clean(payload.heading) ||
+        'TESTIMONIALS',
+
+      serviceName:
+        clean(payload.service_name) ||
+        'LASER HAIR REMOVAL',
+
       reviewQuote,
-      reviewerName: clean(payload.reviewer_name) || 'Client',
-      leftPanelWidth,
-      typography: payload.typography || {},
-      quoteStyle: payload.quote_style || {},
-      requestedLayout: payload.layout || {},
-      panelColour: leftPanelColour,
+
+      reviewerName:
+        clean(payload.reviewer_name) ||
+        'Client',
     });
 
-    const finalPng = await sharp({
-      create: {
-        width,
-        height,
-        channels: 4,
-        background,
-      },
-    })
+    /*
+     * Layer order:
+     * 1. Permanent GitHub template.
+     * 2. Transparent treatment subject.
+     * 3. Exact Poppins typography.
+     *
+     * The footer is already part of the template.
+     */
+    const finalPng = await sharp(
+      baseTemplate
+    )
       .composite([
-        { input: preparedHero, left: 0, top: 0 },
-        { input: textOverlay, left: 0, top: 0 },
-        { input: footerBuffer, left: 0, top: heroHeight },
+        {
+          input: subject.buffer,
+          left: subject.left,
+          top: subject.top,
+        },
+        {
+          input: textOverlay,
+          left: 0,
+          top: 0,
+        },
       ])
-      .png({ compressionLevel: 9, adaptiveFiltering: true })
+      .png({
+        compressionLevel: 9,
+        adaptiveFiltering: true,
+      })
       .toBuffer();
 
-    const filename = clean(payload.output_filename) || 'swisslaser_review.png';
-    res.setHeader('Content-Type', 'image/png');
-    res.setHeader('Content-Disposition', `inline; filename="${filename.replace(/"/g, '')}"`);
-    res.setHeader('Content-Length', String(finalPng.length));
+    const filename =
+      clean(payload.output_filename) ||
+      'swisslaser_review.png';
+
+    res.setHeader(
+      'Content-Type',
+      'image/png'
+    );
+
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${filename.replace(
+        /"/g,
+        ''
+      )}"`
+    );
+
+    res.setHeader(
+      'Content-Length',
+      String(finalPng.length)
+    );
+
     res.send(finalPng);
   } catch (error) {
     console.error(error);
+
     res.status(400).json({
       ok: false,
-      error: error instanceof Error ? error.message : String(error),
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
     });
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`SwissLaser renderer listening on port ${PORT}`);
-});
+app.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
+    console.log(
+      `SwissLaser renderer v5 listening on port ${PORT}`
+    );
+  }
+);
