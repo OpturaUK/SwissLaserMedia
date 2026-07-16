@@ -1,0 +1,16 @@
+services:
+  swisslaser-renderer:
+    build: .
+    container_name: swisslaser-renderer
+    restart: unless-stopped
+    environment:
+      PORT: 8787
+    ports:
+      - "8787:8787"
+    networks:
+      - n8n_network
+
+networks:
+  n8n_network:
+    external: true
+    name: ${N8N_DOCKER_NETWORK}
