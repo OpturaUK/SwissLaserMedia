@@ -122,7 +122,7 @@ async function fetchBuffer(url) {
 
   const response = await fetch(value, {
     headers: {
-      'User-Agent': 'SwissLaserRenderer/5.1',
+      'User-Agent': 'SwissLaserRenderer/5.2',
       Accept: 'image/*',
     },
   });
@@ -185,6 +185,101 @@ async function assertUsefulTransparency(buffer) {
   }
 }
 
+async function inspectSubjectEdges(buffer) {
+  const { data, info } = await sharp(buffer)
+    .rotate()
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const alphaIndex = info.channels - 1;
+  const band = Math.max(
+    3,
+    Math.round(Math.min(info.width, info.height) * 0.006)
+  );
+
+  function alphaAt(x, y) {
+    return data[
+      (y * info.width + x) * info.channels +
+      alphaIndex
+    ];
+  }
+
+  function verticalRatio(fromX, toX) {
+    let opaque = 0;
+    let total = 0;
+
+    for (let y = 0; y < info.height; y += 1) {
+      for (let x = fromX; x < toX; x += 1) {
+        if (alphaAt(x, y) > 24) {
+          opaque += 1;
+        }
+        total += 1;
+      }
+    }
+
+    return total ? opaque / total : 0;
+  }
+
+  function horizontalRatio(fromY, toY) {
+    let opaque = 0;
+    let total = 0;
+
+    for (let y = fromY; y < toY; y += 1) {
+      for (let x = 0; x < info.width; x += 1) {
+        if (alphaAt(x, y) > 24) {
+          opaque += 1;
+        }
+        total += 1;
+      }
+    }
+
+    return total ? opaque / total : 0;
+  }
+
+  return {
+    left: verticalRatio(0, band),
+    right: verticalRatio(
+      Math.max(0, info.width - band),
+      info.width
+    ),
+    top: horizontalRatio(0, band),
+    bottom: horizontalRatio(
+      Math.max(0, info.height - band),
+      info.height
+    ),
+  };
+}
+
+async function assertSafeSubjectFraming(buffer) {
+  const edges = await inspectSubjectEdges(buffer);
+
+  /*
+   * The renderer cannot reconstruct anatomy that the image model has
+   * already cut off. Reject obvious top/left clipping so an arm or head
+   * never enters the final post with a hard rectangular edge.
+   *
+   * Bottom contact is allowed because the torso can finish cleanly at the
+   * footer. A small amount of right-edge contact is also permitted for an
+   * editorial crop, but it is logged for visibility.
+   */
+  if (edges.left > 0.03 || edges.top > 0.03) {
+    throw new Error(
+      'The generated subject is cropped at the source canvas edge. ' +
+      'Regenerate it with the full head and raised arm completely inside ' +
+      'the transparent canvas and at least 8% transparent space on the ' +
+      'top, left and right sides.'
+    );
+  }
+
+  if (edges.right > 0.18) {
+    console.warn(
+      'SwissLaser subject has heavy right-edge contact; ' +
+      'the renderer will keep the full available silhouette.'
+    );
+  }
+}
+
 async function prepareSubject(
   heroBuffer,
   width,
@@ -193,22 +288,105 @@ async function prepareSubject(
   requestedLayout = {}
 ) {
   await assertUsefulTransparency(heroBuffer);
+  await assertSafeSubjectFraming(heroBuffer);
 
   const isDark = variant === 'dark';
 
+  /*
+   * The subject is automatically right- and bottom-aligned. This avoids
+   * the old artificial right-side box that produced hard arm and waist
+   * cut-offs. Legacy left/top payload values are intentionally ignored.
+   */
   const defaults = isDark
     ? {
-        maxWidth: 820,
-        maxHeight: 1150,
-        left: 325,
-        top: 25,
-      }
-    : {
         maxWidth: 760,
         maxHeight: 1140,
-        left: 465,
-        top: 70,
+        minTop: 24,
+        bottomGap: 0,
+        rightInset: 0,
+        xOffset: 0,
+        yOffset: 0,
+        paddingX: 18,
+        paddingTop: 18,
+        paddingBottom: 0,
+      }
+    : {
+        maxWidth: 700,
+        maxHeight: 1125,
+        minTop: 38,
+        bottomGap: 0,
+        rightInset: 0,
+        xOffset: 0,
+        yOffset: 0,
+        paddingX: 18,
+        paddingTop: 18,
+        paddingBottom: 0,
       };
+
+  const minTop = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.min_top,
+        defaults.minTop
+      )
+    ),
+    0,
+    Math.max(0, heroHeight - 650)
+  );
+
+  const bottomGap = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.bottom_gap,
+        defaults.bottomGap
+      )
+    ),
+    0,
+    160
+  );
+
+  const rightInset = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.right_inset,
+        defaults.rightInset
+      )
+    ),
+    0,
+    180
+  );
+
+  const xOffset = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.x_offset,
+        defaults.xOffset
+      )
+    ),
+    -160,
+    160
+  );
+
+  const yOffset = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.y_offset,
+        defaults.yOffset
+      )
+    ),
+    -120,
+    120
+  );
+
+  const availableHeight = Math.max(
+    650,
+    heroHeight - minTop - bottomGap
+  );
+
+  const availableWidth = Math.max(
+    420,
+    width - rightInset
+  );
 
   const maxWidth = clamp(
     Math.round(
@@ -218,7 +396,7 @@ async function prepareSubject(
       )
     ),
     420,
-    width
+    availableWidth
   );
 
   const maxHeight = clamp(
@@ -229,25 +407,46 @@ async function prepareSubject(
       )
     ),
     650,
-    heroHeight
+    availableHeight
   );
 
-  const requestedLeft = Math.round(
-    numberValue(
-      requestedLayout.left,
-      defaults.left
-    )
+  const paddingX = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.padding_x,
+        defaults.paddingX
+      )
+    ),
+    0,
+    80
   );
 
-  const requestedTop = Math.round(
-    numberValue(
-      requestedLayout.top,
-      defaults.top
-    )
+  const paddingTop = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.padding_top,
+        defaults.paddingTop
+      )
+    ),
+    0,
+    80
+  );
+
+  const paddingBottom = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.padding_bottom,
+        defaults.paddingBottom
+      )
+    ),
+    0,
+    100
   );
 
   /*
-   * Remove only genuine transparent padding around the generated subject.
+   * Remove only genuine transparent padding, then add back a small,
+   * controlled transparent safety margin. This keeps hair, shoulders and
+   * the raised arm from looking glued to a rectangular boundary.
    */
   const trimmed = await sharp(heroBuffer)
     .rotate()
@@ -261,13 +460,21 @@ async function prepareSubject(
       },
       threshold: 8,
     })
+    .extend({
+      top: paddingTop,
+      bottom: paddingBottom,
+      left: paddingX,
+      right: paddingX,
+      background: {
+        r: 0,
+        g: 0,
+        b: 0,
+        alpha: 0,
+      },
+    })
     .png()
     .toBuffer();
 
-  /*
-   * Resize the visible subject itself rather than putting it inside a
-   * large bottom-aligned transparent box.
-   */
   const resizedSubject = await sharp(trimmed)
     .resize({
       width: maxWidth,
@@ -290,77 +497,22 @@ async function prepareSubject(
     Number(metadata.height) || maxHeight;
 
   /*
-   * Permit deliberate right-edge or top-edge overflow while cropping it
-   * safely to the usable area above the permanent footer.
+   * Fit the complete cutout inside the full hero canvas. The right edge is
+   * aligned naturally, while the bottom of the torso meets the footer so
+   * any lower-body crop looks intentional rather than floating mid-frame.
    */
-  const sourceLeft = Math.max(
+  const destinationLeft = clamp(
+    width - rightInset - subjectWidth + xOffset,
     0,
-    -requestedLeft
+    Math.max(0, width - subjectWidth)
   );
 
-  const sourceTop = Math.max(
-    0,
-    -requestedTop
+  const destinationTop = clamp(
+    heroHeight - bottomGap - subjectHeight + yOffset,
+    minTop,
+    Math.max(minTop, heroHeight - subjectHeight)
   );
 
-  const destinationLeft = Math.max(
-    0,
-    requestedLeft
-  );
-
-  const destinationTop = Math.max(
-    0,
-    requestedTop
-  );
-
-  const visibleWidth = Math.floor(
-    Math.min(
-      subjectWidth - sourceLeft,
-      width - destinationLeft
-    )
-  );
-
-  const visibleHeight = Math.floor(
-    Math.min(
-      subjectHeight - sourceTop,
-      heroHeight - destinationTop
-    )
-  );
-
-  if (
-    visibleWidth <= 0 ||
-    visibleHeight <= 0
-  ) {
-    throw new Error(
-      'The configured subject position places the treatment subject outside the canvas.'
-    );
-  }
-
-  let visibleSubject = resizedSubject;
-
-  if (
-    sourceLeft > 0 ||
-    sourceTop > 0 ||
-    visibleWidth < subjectWidth ||
-    visibleHeight < subjectHeight
-  ) {
-    visibleSubject = await sharp(
-      resizedSubject
-    )
-      .extract({
-        left: sourceLeft,
-        top: sourceTop,
-        width: visibleWidth,
-        height: visibleHeight,
-      })
-      .png()
-      .toBuffer();
-  }
-
-  /*
-   * Build one transparent stage matching the full usable hero area.
-   * This makes the placement deterministic for every generation.
-   */
   const subjectStage = await sharp({
     create: {
       width,
@@ -376,7 +528,7 @@ async function prepareSubject(
   })
     .composite([
       {
-        input: visibleSubject,
+        input: resizedSubject,
         left: destinationLeft,
         top: destinationTop,
       },
@@ -637,7 +789,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'swisslaser-renderer',
-    version: '5.1.0',
+    version: '5.2.0',
     typography: 'Poppins locked',
     templates: 'full-image locked',
   });
@@ -846,7 +998,7 @@ app.listen(
   '0.0.0.0',
   () => {
     console.log(
-      `SwissLaser renderer v5.1 listening on port ${PORT}`
+      `SwissLaser renderer v5.2 listening on port ${PORT}`
     );
   }
 );
