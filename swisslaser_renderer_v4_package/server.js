@@ -122,7 +122,7 @@ async function fetchBuffer(url) {
 
   const response = await fetch(value, {
     headers: {
-      'User-Agent': 'SwissLaserRenderer/5.0',
+      'User-Agent': 'SwissLaserRenderer/5.1',
       Accept: 'image/*',
     },
   });
@@ -189,27 +189,66 @@ async function prepareSubject(
   heroBuffer,
   width,
   heroHeight,
-  variant
+  variant,
+  requestedLayout = {}
 ) {
   await assertUsefulTransparency(heroBuffer);
 
   const isDark = variant === 'dark';
 
+  const defaults = isDark
+    ? {
+        maxWidth: 820,
+        maxHeight: 1150,
+        left: 325,
+        top: 25,
+      }
+    : {
+        maxWidth: 760,
+        maxHeight: 1140,
+        left: 465,
+        top: 70,
+      };
+
+  const maxWidth = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.max_width,
+        defaults.maxWidth
+      )
+    ),
+    420,
+    width
+  );
+
+  const maxHeight = clamp(
+    Math.round(
+      numberValue(
+        requestedLayout.max_height,
+        defaults.maxHeight
+      )
+    ),
+    650,
+    heroHeight
+  );
+
+  const requestedLeft = Math.round(
+    numberValue(
+      requestedLayout.left,
+      defaults.left
+    )
+  );
+
+  const requestedTop = Math.round(
+    numberValue(
+      requestedLayout.top,
+      defaults.top
+    )
+  );
+
   /*
-   * Dark designs allow the model to extend further
-   * toward the centre, matching the dark reference.
+   * Remove only genuine transparent padding around the generated subject.
    */
-  const subjectBoxWidth = isDark
-    ? 735
-    : 655;
-
-  const subjectLeft =
-    width - subjectBoxWidth;
-
-  const verticalOffset = isDark
-    ? 0
-    : 6;
-
   const trimmed = await sharp(heroBuffer)
     .rotate()
     .ensureAlpha()
@@ -225,27 +264,130 @@ async function prepareSubject(
     .png()
     .toBuffer();
 
-  const subjectLayer = await sharp(trimmed)
+  /*
+   * Resize the visible subject itself rather than putting it inside a
+   * large bottom-aligned transparent box.
+   */
+  const resizedSubject = await sharp(trimmed)
     .resize({
-      width: subjectBoxWidth,
-      height: heroHeight - verticalOffset,
-      fit: 'contain',
-      position: 'right bottom',
+      width: maxWidth,
+      height: maxHeight,
+      fit: 'inside',
+      position: 'center',
+      withoutEnlargement: false,
+    })
+    .png()
+    .toBuffer();
+
+  const metadata = await sharp(
+    resizedSubject
+  ).metadata();
+
+  const subjectWidth =
+    Number(metadata.width) || maxWidth;
+
+  const subjectHeight =
+    Number(metadata.height) || maxHeight;
+
+  /*
+   * Permit deliberate right-edge or top-edge overflow while cropping it
+   * safely to the usable area above the permanent footer.
+   */
+  const sourceLeft = Math.max(
+    0,
+    -requestedLeft
+  );
+
+  const sourceTop = Math.max(
+    0,
+    -requestedTop
+  );
+
+  const destinationLeft = Math.max(
+    0,
+    requestedLeft
+  );
+
+  const destinationTop = Math.max(
+    0,
+    requestedTop
+  );
+
+  const visibleWidth = Math.floor(
+    Math.min(
+      subjectWidth - sourceLeft,
+      width - destinationLeft
+    )
+  );
+
+  const visibleHeight = Math.floor(
+    Math.min(
+      subjectHeight - sourceTop,
+      heroHeight - destinationTop
+    )
+  );
+
+  if (
+    visibleWidth <= 0 ||
+    visibleHeight <= 0
+  ) {
+    throw new Error(
+      'The configured subject position places the treatment subject outside the canvas.'
+    );
+  }
+
+  let visibleSubject = resizedSubject;
+
+  if (
+    sourceLeft > 0 ||
+    sourceTop > 0 ||
+    visibleWidth < subjectWidth ||
+    visibleHeight < subjectHeight
+  ) {
+    visibleSubject = await sharp(
+      resizedSubject
+    )
+      .extract({
+        left: sourceLeft,
+        top: sourceTop,
+        width: visibleWidth,
+        height: visibleHeight,
+      })
+      .png()
+      .toBuffer();
+  }
+
+  /*
+   * Build one transparent stage matching the full usable hero area.
+   * This makes the placement deterministic for every generation.
+   */
+  const subjectStage = await sharp({
+    create: {
+      width,
+      height: heroHeight,
+      channels: 4,
       background: {
         r: 0,
         g: 0,
         b: 0,
         alpha: 0,
       },
-      withoutEnlargement: false,
-    })
+    },
+  })
+    .composite([
+      {
+        input: visibleSubject,
+        left: destinationLeft,
+        top: destinationTop,
+      },
+    ])
     .png()
     .toBuffer();
 
   return {
-    buffer: subjectLayer,
-    left: subjectLeft,
-    top: verticalOffset,
+    buffer: subjectStage,
+    left: 0,
+    top: 0,
   };
 }
 
@@ -495,7 +637,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'swisslaser-renderer',
-    version: '5.0.0',
+    version: '5.1.0',
     typography: 'Poppins locked',
     templates: 'full-image locked',
   });
@@ -610,7 +752,8 @@ app.post('/render-review', async (req, res) => {
       heroBuffer,
       width,
       heroHeight,
-      variant
+      variant,
+      payload.subject_layout || {}
     );
 
     const textOverlay = buildTextSvg({
@@ -703,7 +846,7 @@ app.listen(
   '0.0.0.0',
   () => {
     console.log(
-      `SwissLaser renderer v5 listening on port ${PORT}`
+      `SwissLaser renderer v5.1 listening on port ${PORT}`
     );
   }
 );
